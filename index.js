@@ -8,7 +8,8 @@ const {
 } = require("docx");
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+app.disable("x-powered-by");
+app.use(express.json({ limit: "1mb" }));
 
 /* ══════════════════════════════════════════════════════
    AUTH — this service is internal-only (called by the
@@ -42,14 +43,39 @@ function requireServiceToken(req, res, next) {
    without a cap a request burst exhausts the host.
 ══════════════════════════════════════════════════════ */
 const MAX_CONCURRENT_RENDERS = 3;
+const MAX_HTML_CHARS = 500_000;
+const RENDER_TIMEOUT_MS = 30_000;
 let activeRenders = 0;
+const MAX_CONCURRENT_WORD_GENERATIONS = 2;
+const MAX_WORD_ITEMS = 50;
+const MAX_WORD_TEXT_CHARS = 5_000;
+let activeWordGenerations = 0;
+
+function hasSafeDocumentShape(value, depth = 0) {
+  if (depth > 8 || value == null || typeof value === "boolean" || typeof value === "number") return depth <= 8;
+  if (typeof value === "string") return value.length <= MAX_WORD_TEXT_CHARS;
+  if (Array.isArray(value)) {
+    return value.length <= MAX_WORD_ITEMS && value.every((item) => hasSafeDocumentShape(item, depth + 1));
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value);
+    return entries.length <= MAX_WORD_ITEMS && entries.every(([key, item]) =>
+      key.length <= 80 && hasSafeDocumentShape(item, depth + 1));
+  }
+  return false;
+}
+
+function safeFileStem(value) {
+  const normalized = typeof value === "string" ? value.normalize("NFKD") : "";
+  const stem = normalized.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 80);
+  return stem || `Resume_${Date.now()}`;
+}
 
 /* ══════════════════════════════════════════════════════
    SHARED BROWSER — one Chromium for the process lifetime
    (a fresh page per request) instead of a full launch per
-   request. Relaunches automatically if it crashes.
-   --no-sandbox is required because the container runs as
-   root; SSRF is instead blocked per-request below.
+   request. Relaunches automatically if it crashes. The container runs as a
+   dedicated non-root user, so Chromium's sandbox remains enabled.
 ══════════════════════════════════════════════════════ */
 let browserPromise = null;
 
@@ -63,8 +89,6 @@ async function getBrowser() {
   browserPromise = puppeteer.launch({
     headless: true,
     args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
     ],
@@ -85,8 +109,7 @@ function isRequestAllowed(url) {
   if (url.startsWith("data:") || url === "about:blank") return true;
   try {
     const parsed = new URL(url);
-    return (parsed.protocol === "https:" || parsed.protocol === "http:")
-        && ALLOWED_REMOTE_HOSTS.has(parsed.hostname);
+    return parsed.protocol === "https:" && ALLOWED_REMOTE_HOSTS.has(parsed.hostname);
   } catch {
     return false;
   }
@@ -105,8 +128,11 @@ app.get("/health", (req, res) => {
 app.post("/generate-pdf", requireServiceToken, async (req, res) => {
   const { html, paperSize } = req.body;
 
-  if (!html || !html.trim()) {
+  if (typeof html !== "string" || !html.trim()) {
     return res.status(400).json({ error: "html is required and cannot be empty" });
+  }
+  if (html.length > MAX_HTML_CHARS) {
+    return res.status(413).json({ error: "HTML payload is too large" });
   }
 
   if (activeRenders >= MAX_CONCURRENT_RENDERS) {
@@ -118,6 +144,8 @@ app.post("/generate-pdf", requireServiceToken, async (req, res) => {
   try {
     const browser = await getBrowser();
     page = await browser.newPage();
+    page.setDefaultTimeout(RENDER_TIMEOUT_MS);
+    page.setDefaultNavigationTimeout(RENDER_TIMEOUT_MS);
 
     // Block all network access from the rendered document except data: URIs
     // and the webfont allowlist (see isRequestAllowed).
@@ -127,7 +155,7 @@ app.post("/generate-pdf", requireServiceToken, async (req, res) => {
       else request.abort();
     });
 
-    await page.setContent(html, { waitUntil: "networkidle0", timeout: 30000 });
+    await page.setContent(html, { waitUntil: "networkidle0", timeout: RENDER_TIMEOUT_MS });
 
     const format = paperSize === "letter" ? "Letter" : "A4";
 
@@ -149,7 +177,7 @@ app.post("/generate-pdf", requireServiceToken, async (req, res) => {
 
   } catch (err) {
     console.error("PDF generation error:", err);
-    res.status(500).json({ error: "PDF generation failed: " + err.message });
+    res.status(500).json({ error: "PDF generation failed" });
   } finally {
     if (page) { try { await page.close(); } catch {} }
     activeRenders--;
@@ -162,14 +190,30 @@ app.post("/generate-pdf", requireServiceToken, async (req, res) => {
 app.post("/generate-word", requireServiceToken, async (req, res) => {
   const { data, styles } = req.body;
 
-  if (!data) {
+  if (!data || typeof data !== "object" || Array.isArray(data) || !hasSafeDocumentShape(data) || !hasSafeDocumentShape(styles || {})) {
     return res.status(400).json({ error: "data is required" });
   }
+  if (activeWordGenerations >= MAX_CONCURRENT_WORD_GENERATIONS) {
+    return res.status(429).json({ error: "Document generator busy, retry shortly" });
+  }
+
+  const pi = data.personalInfo && typeof data.personalInfo === "object" && !Array.isArray(data.personalInfo)
+    ? data.personalInfo : {};
+  const ac = typeof styles?.ac === "string" && /^#[0-9a-f]{6}$/i.test(styles.ac) ? styles.ac : "#2563eb";
+  const fs = typeof styles?.fs === "number" && Number.isFinite(styles.fs)
+    ? Math.max(8, Math.min(14, styles.fs)) : 11;
+  activeWordGenerations++;
 
   try {
-    const pi = data.personalInfo || {};
-    const ac = styles?.ac || "#2563eb";
-    const fs = styles?.fs || 11;
+    const objectItems = (value) => Array.isArray(value)
+      ? value.filter((item) => item && typeof item === "object" && !Array.isArray(item)) : [];
+    const stringItems = (value) => Array.isArray(value)
+      ? value.filter((item) => typeof item === "string") : [];
+    const skillCategories = objectItems(data.skillCategories);
+    const experience = objectItems(data.experience);
+    const projects = objectItems(data.projects);
+    const education = objectItems(data.education);
+    const certifications = Array.isArray(data.certifications) ? data.certifications : [];
 
     const hexToRgb = (hex) => {
       const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
@@ -241,9 +285,9 @@ app.post("/generate-word", requireServiceToken, async (req, res) => {
     }
 
     // ── SKILLS ──
-    if ((data.skillCategories || []).length > 0) {
+    if (skillCategories.length > 0) {
       children.push(sectionHeading("Technical Skills"));
-      data.skillCategories.forEach(cat => {
+      skillCategories.forEach(cat => {
         children.push(new Paragraph({
           children: [
             new TextRun({ text: `${cat.name}: `, bold: true, size: fs * 2 }),
@@ -255,9 +299,9 @@ app.post("/generate-word", requireServiceToken, async (req, res) => {
     }
 
     // ── EXPERIENCE ──
-    if ((data.experience || []).length > 0) {
+    if (experience.length > 0) {
       children.push(sectionHeading("Work Experience"));
-      data.experience.forEach((exp, i) => {
+      experience.forEach((exp, i) => {
         children.push(new Paragraph({
           children: [
             new TextRun({ text: `${exp.company}${exp.role ? ` — ${exp.role}` : ""}`, bold: true, size: fs * 2 }),
@@ -271,7 +315,7 @@ app.post("/generate-word", requireServiceToken, async (req, res) => {
             spacing: { after: 60 },
           }));
         }
-        (exp.bullets || []).forEach(bullet => {
+        stringItems(exp.bullets).forEach(bullet => {
           children.push(new Paragraph({
             children: [new TextRun({ text: bullet, size: fs * 2 })],
             bullet: { level: 0 },
@@ -282,9 +326,9 @@ app.post("/generate-word", requireServiceToken, async (req, res) => {
     }
 
     // ── PROJECTS ──
-    if ((data.projects || []).length > 0) {
+    if (projects.length > 0) {
       children.push(sectionHeading("Projects"));
-      data.projects.forEach((proj, i) => {
+      projects.forEach((proj, i) => {
         children.push(new Paragraph({
           children: [
             new TextRun({ text: proj.title || proj.name || "", bold: true, size: fs * 2, color: accentColor }),
@@ -298,7 +342,7 @@ app.post("/generate-word", requireServiceToken, async (req, res) => {
             spacing: { after: 60 },
           }));
         }
-        (proj.bullets || []).forEach(bullet => {
+        stringItems(proj.bullets).forEach(bullet => {
           children.push(new Paragraph({
             children: [new TextRun({ text: bullet, size: fs * 2 })],
             bullet: { level: 0 },
@@ -309,9 +353,9 @@ app.post("/generate-word", requireServiceToken, async (req, res) => {
     }
 
     // ── EDUCATION ──
-    if ((data.education || []).length > 0) {
+    if (education.length > 0) {
       children.push(sectionHeading("Education"));
-      data.education.forEach((edu, i) => {
+      education.forEach((edu, i) => {
         children.push(new Paragraph({
           children: [
             new TextRun({ text: edu.school || edu.institution || "", bold: true, size: fs * 2 }),
@@ -330,7 +374,7 @@ app.post("/generate-word", requireServiceToken, async (req, res) => {
     }
 
     // ── CERTIFICATIONS ──
-    const validCerts = (data.certifications || []).filter(c =>
+    const validCerts = certifications.filter(c =>
       typeof c === "string" ? c.trim() : c?.name?.trim()
     );
     if (validCerts.length > 0) {
@@ -361,7 +405,7 @@ app.post("/generate-word", requireServiceToken, async (req, res) => {
 
     const buffer = await Packer.toBuffer(doc);
 
-    const name = pi.name ? pi.name.replace(/\s+/g, "_") : `Resume_${Date.now()}`;
+    const name = safeFileStem(pi.name);
     res.set({
       "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "Content-Disposition": `attachment; filename=${name}_Resume.docx`,
@@ -371,7 +415,9 @@ app.post("/generate-word", requireServiceToken, async (req, res) => {
 
   } catch (err) {
     console.error("Word generation error:", err);
-    res.status(500).json({ error: "Word generation failed: " + err.message });
+    res.status(500).json({ error: "Word generation failed" });
+  } finally {
+    activeWordGenerations--;
   }
 });
 

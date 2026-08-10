@@ -1,0 +1,25 @@
+services:
+  replysis-pdf-service:
+    build:
+      context: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:3001:3001"
+    environment:
+      PDF_SERVICE_TOKEN: ${PDF_SERVICE_TOKEN:?Set PDF_SERVICE_TOKEN before starting the service.}
+      NODE_ENV: production
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+      - /home/pdfservice/.cache:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_ADMIN
+      - SYS_CHROOT
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    pids_limit: 300
+    cpus: 1.0

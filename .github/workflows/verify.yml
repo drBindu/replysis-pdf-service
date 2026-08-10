@@ -1,0 +1,36 @@
+name: Verify PDF Service
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.4.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run verify
+      - run: npm audit --omit=dev --audit-level=high
+      - run: docker build --pull --tag replysis-pdf-service:verify .
+      - name: Smoke test production container
+        run: |
+          docker run -d --rm --name replysis-pdf-service-verify -p 3001:3001 -e PDF_SERVICE_TOKEN=ci-only replysis-pdf-service:verify
+          for attempt in $(seq 1 12); do
+            if curl -fsS http://127.0.0.1:3001/health >/dev/null; then
+              docker stop replysis-pdf-service-verify
+              exit 0
+            fi
+            sleep 5
+          done
+          docker logs replysis-pdf-service-verify
+          docker stop replysis-pdf-service-verify || true
+          exit 1

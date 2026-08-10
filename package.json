@@ -1,10 +1,11 @@
 {
-  "name": "coopilotx-pdf-service",
+  "name": "replysis-pdf-service",
   "version": "1.0.0",
-  "description": "PDF and Word generation service for CoopilotX AI",
+  "description": "PDF and Word generation service for Replysis AI",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "verify": "node --check index.js"
   },
   "dependencies": {
     "docx": "^8.5.0",
