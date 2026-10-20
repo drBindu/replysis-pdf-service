@@ -398,6 +398,11 @@ app.post("/generate-word", requireServiceToken, async (req, res) => {
       if (items.length === 0) continue;
       children.push(sectionHeading(String(cs.title || "More")));
       items.forEach(it => {
+        // A line with nothing but its text (a language, an award) is a plain bullet, like the preview.
+        if (it.title && !it.subtitle && !it.date && !it.description) {
+          children.push(new Paragraph({ children: [new TextRun({ text: String(it.title), size: fs * 2 })], bullet: { level: 0 }, spacing: { after: 40 } }));
+          return;
+        }
         if (it.title || it.date) children.push(new Paragraph({
           children: [
             new TextRun({ text: String(it.title || ""), bold: true, size: fs * 2 }),
