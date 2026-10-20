@@ -391,6 +391,26 @@ app.post("/generate-word", requireServiceToken, async (req, res) => {
       });
     }
 
+    // ── CUSTOM SECTIONS (Awards, Languages, Volunteering...) ──
+    // They were left out of every download before 2026-10-20.
+    for (const cs of objectItems(data.customSections)) {
+      const items = objectItems(cs.items).filter(it => it.title || it.subtitle || it.description);
+      if (items.length === 0) continue;
+      children.push(sectionHeading(String(cs.title || "More")));
+      items.forEach(it => {
+        if (it.title || it.date) children.push(new Paragraph({
+          children: [
+            new TextRun({ text: String(it.title || ""), bold: true, size: fs * 2 }),
+            ...(it.date ? [new TextRun({ text: `   ${it.date}`, size: (fs - 1) * 2, color: "6b7280" })] : []),
+          ],
+          spacing: { before: 60, after: 20 },
+        }));
+        if (it.subtitle) children.push(new Paragraph({ children: [new TextRun({ text: String(it.subtitle), italics: true, size: (fs - 1) * 2, color: "6b7280" })], spacing: { after: 20 } }));
+        String(it.description || "").split(/\n+/).filter(l => l.trim()).forEach(line =>
+          children.push(new Paragraph({ children: [new TextRun({ text: line.trim(), size: fs * 2 })], spacing: { after: 40 } })));
+      });
+    }
+
     // ── BUILD DOCUMENT ──
     const doc = new Document({
       sections: [{
